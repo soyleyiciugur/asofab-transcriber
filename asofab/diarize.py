@@ -24,18 +24,28 @@ def run_diarization(job, settings: dict, progress: Callable[[float, str], None])
     cmd = ([sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "asofab.main"])
     cmd += ["--diarize-worker", job.id]
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+    def attempt(env_extra: dict) -> tuple[int, list[str]]:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                encoding="utf-8", errors="replace", creationflags=flags,
+                                env={**os.environ, **env_extra})
+        tail: list[str] = []
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line.startswith("PROGRESS "):
+                _, frac, msg = line.split(" ", 2)
+                progress(float(frac), msg)
+            elif line:
+                tail = (tail + [line])[-25:]
+        return proc.wait(), tail
+
     progress(0.02, "Starting diarization worker (loading models, this can take a minute)")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            encoding="utf-8", errors="replace", creationflags=flags)
-    tail: list[str] = []
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line.startswith("PROGRESS "):
-            _, frac, msg = line.split(" ", 2)
-            progress(float(frac), msg)
-        elif line:
-            tail = (tail + [line])[-25:]
-    code = proc.wait()
+    code, tail = attempt({})
+    if code not in (0, 1) and os.environ.get("CUDA_VISIBLE_DEVICES") != "-1":
+        # Exit code 1 is an ordinary Python error (bad token, missing terms). Anything else is a
+        # native crash, in practice a broken GPU/cuDNN setup. The result is the same model, only slower.
+        progress(0.02, f"GPU diarization crashed (exit code {code}). Retrying on CPU: slower, same accuracy.")
+        code, tail = attempt({"CUDA_VISIBLE_DEVICES": "-1"})
     if code != 0:
         hint = ""
         if code in (3221225477, -1073741819):

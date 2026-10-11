@@ -1,8 +1,21 @@
+diff --git a/.github/workflows/build-windows.yml b/.github/workflows/build-windows.yml
+index 12f0624..6ace62a 100644
+--- a/.github/workflows/build-windows.yml
++++ b/.github/workflows/build-windows.yml
+@@ -36,7 +36,7 @@ jobs:
+         shell: pwsh
+         run: |
+           python -m pip install --upgrade pip
+-          pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
++          pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+           pip install -r requirements-dev.txt
+ 
+       - name: Run tests
 diff --git a/asofab/diarize.py b/asofab/diarize.py
-index bbf7c8c..905534a 100644
+index bbf7c8c..229e4c8 100644
 --- a/asofab/diarize.py
 +++ b/asofab/diarize.py
-@@ -13,6 +13,63 @@ from typing import Callable
+@@ -13,6 +13,73 @@ from typing import Callable
  
  
  def run_diarization(job, settings: dict, progress: Callable[[float, str], None]) -> None:
@@ -17,18 +30,28 @@ index bbf7c8c..905534a 100644
 +    cmd = ([sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "asofab.main"])
 +    cmd += ["--diarize-worker", job.id]
 +    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
++
++    def attempt(env_extra: dict) -> tuple[int, list[str]]:
++        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
++                                encoding="utf-8", errors="replace", creationflags=flags,
++                                env={**os.environ, **env_extra})
++        tail: list[str] = []
++        for line in proc.stdout:
++            line = line.rstrip()
++            if line.startswith("PROGRESS "):
++                _, frac, msg = line.split(" ", 2)
++                progress(float(frac), msg)
++            elif line:
++                tail = (tail + [line])[-25:]
++        return proc.wait(), tail
++
 +    progress(0.02, "Starting diarization worker (loading models, this can take a minute)")
-+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-+                            encoding="utf-8", errors="replace", creationflags=flags)
-+    tail: list[str] = []
-+    for line in proc.stdout:
-+        line = line.rstrip()
-+        if line.startswith("PROGRESS "):
-+            _, frac, msg = line.split(" ", 2)
-+            progress(float(frac), msg)
-+        elif line:
-+            tail = (tail + [line])[-25:]
-+    code = proc.wait()
++    code, tail = attempt({})
++    if code not in (0, 1) and os.environ.get("CUDA_VISIBLE_DEVICES") != "-1":
++        # Exit code 1 is an ordinary Python error (bad token, missing terms). Anything else is a
++        # native crash, in practice a broken GPU/cuDNN setup. The result is the same model, only slower.
++        progress(0.02, f"GPU diarization crashed (exit code {code}). Retrying on CPU: slower, same accuracy.")
++        code, tail = attempt({"CUDA_VISIBLE_DEVICES": "-1"})
 +    if code != 0:
 +        hint = ""
 +        if code in (3221225477, -1073741819):
@@ -66,7 +89,7 @@ index bbf7c8c..905534a 100644
      token = settings.get("hf_token") or None
      try:
          import torch
-@@ -32,7 +89,8 @@ def run_diarization(job, settings: dict, progress: Callable[[float, str], None])
+@@ -32,7 +99,8 @@ def run_diarization(job, settings: dict, progress: Callable[[float, str], None])
      use_cuda = torch.cuda.is_available()
      if use_cuda:
          pipe.to(torch.device("cuda"))
@@ -141,3 +164,15 @@ index b89dd87..f1504e1 100644
      uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
  
  
+diff --git a/requirements.txt b/requirements.txt
+index badf7eb..caee0fc 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -13,4 +13,6 @@ pyannote.audio>=3.1,<4.0
+ huggingface_hub>=0.23,<1.0
+ # CUDA runtime libraries used by faster-whisper (ctranslate2) on NVIDIA GPUs
+ nvidia-cublas-cu12==12.1.3.1; platform_system == "Windows"
+-nvidia-cudnn-cu12>=9,<10; platform_system == "Windows"
++# Must be the SAME cuDNN that torch 2.5.1+cu121 bundles. A newer one next to it in the exe
++# loads mismatched DLLs: "Could not load symbol cudnnGetLibConfig. Error code 127".
++nvidia-cudnn-cu12==9.1.0.70; platform_system == "Windows"
