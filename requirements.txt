@@ -9,6 +9,8 @@ soundfile>=0.12
 faster-whisper>=1.0.3
 # pyannote 4.x changed the auth-token argument; this code targets 3.x
 pyannote.audio>=3.1,<4.0
+# pyannote 3.x still passes use_auth_token, which huggingface_hub 1.0 removed
+huggingface_hub>=0.23,<1.0
 # CUDA runtime libraries used by faster-whisper (ctranslate2) on NVIDIA GPUs
 nvidia-cublas-cu12==12.1.3.1; platform_system == "Windows"
 nvidia-cudnn-cu12>=9,<10; platform_system == "Windows"

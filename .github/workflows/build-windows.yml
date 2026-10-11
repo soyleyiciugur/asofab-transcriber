@@ -52,9 +52,17 @@ jobs:
           foreach ($n in "ffmpeg", "ffprobe") {
             $f = Get-Item "$d/$n.exe"
             if ($f.Length -lt 5MB) { throw "bundled $n.exe is too small ($($f.Length) bytes)" }
-            & "$d/$n.exe" -version | Select-Object -First 1
+            $out = & "$d/$n.exe" -version 2>&1
             if ($LASTEXITCODE -ne 0) { throw "bundled $n.exe failed to run" }
+            ($out | Select-Object -First 1)
           }
+
+      - name: Self-test the executable (FFmpeg, torch, pyannote, whisper all load)
+        shell: pwsh
+        run: |
+          $env:ASOFAB_HOME = "$PWD/selftest-data"
+          & "dist/ASOFAB-Transcriber/ASOFAB-Transcriber.exe" --selftest 2>&1 | Tee-Object selftest.log
+          if ($LASTEXITCODE -ne 0) { throw "self-test failed, see the FAIL lines above" }
 
       - name: Smoke test the executable
         shell: pwsh

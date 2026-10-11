@@ -319,6 +319,11 @@ def download_drive_file(file_id: str, dest: Path,
                 break
             if not r.ok:
                 raise _explain(r, "Downloading recording")
+            if r.status_code == 200 and have > 0:
+                # Server ignored the Range header and is sending the whole file: start over.
+                f.truncate(0)
+                f.seek(0)
+                have = 0
             n = 0
             for block in r.iter_content(1 << 20):
                 f.write(block)

@@ -19,5 +19,8 @@ def _add_bundled_dll_dirs() -> None:
 
 if __name__ == "__main__":
     _add_bundled_dll_dirs()
+    if "--selftest" in sys.argv:
+        from asofab.selftest import run
+        sys.exit(run())
     from asofab.main import main
     main()

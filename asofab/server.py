@@ -102,6 +102,13 @@ def settings(body: dict = Body(...)):
 # --------------------------------------------------------------------- jobs
 
 
+def _start(job_id: str, **kw) -> None:
+    try:
+        runner.start(job_id, **kw)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+
+
 @app.post("/api/analyze")
 def analyze(body: dict = Body(...)):
     link = (body.get("link") or "").strip()
@@ -133,7 +140,7 @@ def stop(job_id: str):
 @app.post("/api/jobs/{job_id}/resume")
 def resume(job_id: str):
     _job(job_id)
-    runner.start(job_id)
+    _start(job_id)
     return {"ok": True}
 
 
@@ -142,17 +149,19 @@ def retry(job_id: str, stage: str):
     _job(job_id)
     if stage not in STAGES:
         raise HTTPException(400, "unknown stage")
-    runner.start(job_id, only=stage, force=True)
+    _start(job_id, only=stage, force=True)
     return {"ok": True}
 
 
 @app.post("/api/jobs/{job_id}/choose-record")
 def choose_record(job_id: str, body: dict = Body(...)):
     j = _job(job_id)
+    if runner.running(job_id):
+        raise HTTPException(409, "This job is still running. Stop it first.")
     j.update_meta(choose_record=body.get("record"), recording_index=body.get("recording_index", 0))
     for s in STAGES:
         j.set_stage(s, "pending")
-    runner.start(job_id)
+    _start(job_id)
     return {"ok": True}
 
 

@@ -391,6 +391,14 @@ class Runner:
                     job.set_stage(st, "failed", error=str(e), code=code,
                                   trace=traceback.format_exc()[-1500:] if code == "error" else "")
                     return
+        except BaseException as e:  # never let the thread die silently with a stage stuck on "running"
+            try:
+                for st in STAGES:
+                    if job.stage_status(st) == "running":
+                        job.set_stage(st, "failed", error=f"Unexpected error: {e}",
+                                      code="error", trace=traceback.format_exc()[-1500:])
+            except Exception:
+                pass
         finally:
             if load_settings().get("delete_temp_audio_after") and all(
                     job.stage_status(s) == "done" for s in STAGES):
