@@ -1,0 +1,14 @@
+fastapi>=0.110
+uvicorn>=0.29
+requests>=2.31
+google-auth>=2.29
+google-auth-oauthlib>=1.2
+keyring>=25
+numpy>=1.26,<2.0
+soundfile>=0.12
+faster-whisper>=1.0.3
+# pyannote 4.x changed the auth-token argument; this code targets 3.x
+pyannote.audio>=3.1,<4.0
+# CUDA runtime libraries used by faster-whisper (ctranslate2) on NVIDIA GPUs
+nvidia-cublas-cu12; platform_system == "Windows"
+nvidia-cudnn-cu9; platform_system == "Windows"
