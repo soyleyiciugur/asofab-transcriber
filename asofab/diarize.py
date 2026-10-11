@@ -13,6 +13,63 @@ from typing import Callable
 
 
 def run_diarization(job, settings: dict, progress: Callable[[float, str], None]) -> None:
+    """Runs pyannote in a child process. A native crash (access violation, OpenMP abort, missing
+    CUDA DLL) then fails this one stage with an explanation instead of killing the whole app."""
+    import os
+    import subprocess
+    import sys
+    if os.environ.get("ASOFAB_INPROC") == "1":
+        return _diarize_inprocess(job, settings, progress)
+    from .config import app_dir
+    cmd = ([sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "asofab.main"])
+    cmd += ["--diarize-worker", job.id]
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    progress(0.02, "Starting diarization worker (loading models, this can take a minute)")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            encoding="utf-8", errors="replace", creationflags=flags)
+    tail: list[str] = []
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line.startswith("PROGRESS "):
+            _, frac, msg = line.split(" ", 2)
+            progress(float(frac), msg)
+        elif line:
+            tail = (tail + [line])[-25:]
+    code = proc.wait()
+    if code != 0:
+        hint = ""
+        if code in (3221225477, -1073741819):
+            hint = " (0xC0000005 access violation: a native library crashed, usually a CUDA/DLL problem.)"
+        elif code in (3, 134, -6):
+            hint = " (the process aborted, often an OpenMP/DLL conflict.)"
+        elif code in (3221226505, -1073740791):
+            hint = " (0xC0000409: native stack/DLL failure.)"
+        raise RuntimeError(f"The diarization process stopped unexpectedly with exit code {code}{hint}\n"
+                           + "\n".join(tail[-12:])
+                           + f"\nFull log: {app_dir() / 'asofab.log'}")
+
+
+def worker_main(job_id: str) -> int:
+    """Child process entry: runs diarization and reports progress on stdout."""
+    import traceback
+    from .config import load_settings
+    from .store import Job
+
+    def progress(frac: float, msg: str) -> None:
+        print(f"PROGRESS {frac:.3f} {msg}", flush=True)
+
+    try:
+        from . import hf_compat
+        hf_compat.install()
+        _diarize_inprocess(Job(job_id), load_settings(), progress)
+        return 0
+    except Exception as e:
+        traceback.print_exc()
+        print(f"{type(e).__name__}: {e}", flush=True)
+        return 1
+
+
+def _diarize_inprocess(job, settings: dict, progress: Callable[[float, str], None]) -> None:
     token = settings.get("hf_token") or None
     try:
         import torch
@@ -32,7 +89,8 @@ def run_diarization(job, settings: dict, progress: Callable[[float, str], None])
     use_cuda = torch.cuda.is_available()
     if use_cuda:
         pipe.to(torch.device("cuda"))
-    progress(0.05, "Diarizing full recording (global clustering)")
+    device = "GPU" if use_cuda else "CPU (slow: a long session can take hours)"
+    progress(0.05, f"Diarizing full recording on {device}. No percentage is available until it finishes.")
     diar, emb = pipe(str(job.audio_path), min_speakers=settings.get("min_speakers", 2),
                      max_speakers=settings.get("max_speakers", 6), return_embeddings=True)
     labels = list(diar.labels())
