@@ -1,0 +1,179 @@
+"""Whole-recording acoustic diarization (pyannote) plus word-to-speaker assignment.
+
+Diarization runs over the complete audio in one pass so cluster identities are global:
+there are no per-chunk speaker resets.
+"""
+from __future__ import annotations
+
+import math
+from collections import defaultdict
+from typing import Callable
+
+# ------------------------------------------------------------------ execution
+
+
+def run_diarization(job, settings: dict, progress: Callable[[float, str], None]) -> None:
+    token = settings.get("hf_token") or None
+    try:
+        import torch
+        from pyannote.audio import Pipeline
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(f"pyannote.audio is not available: {e}")
+    try:
+        pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+    except Exception as e:
+        raise RuntimeError(
+            "Could not load the pyannote diarization model. You must (1) create a free Hugging Face "
+            "account, (2) accept the terms on https://hf.co/pyannote/speaker-diarization-3.1 and "
+            "https://hf.co/pyannote/segmentation-3.0, and (3) paste a read token in Settings. "
+            f"Detail: {str(e)[:200]}")
+    if pipe is None:
+        raise RuntimeError("pyannote returned no pipeline. Check the Hugging Face token and accepted terms.")
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        pipe.to(torch.device("cuda"))
+    progress(0.05, "Diarizing full recording (global clustering)")
+    diar, emb = pipe(str(job.audio_path), min_speakers=settings.get("min_speakers", 2),
+                     max_speakers=settings.get("max_speakers", 6), return_embeddings=True)
+    labels = list(diar.labels())
+    turns = [{"start": float(t.start), "end": float(t.end), "cluster": str(lab)}
+             for t, _, lab in diar.itertracks(yield_label=True)]
+    centroids = {str(lab): [float(x) for x in emb[i]] for i, lab in enumerate(labels)}
+    dur = defaultdict(float)
+    for t in turns:
+        dur[t["cluster"]] += t["end"] - t["start"]
+    job.write("diarization.json", {"turns": turns, "centroids": centroids, "durations": dict(dur),
+                                   "num_clusters": len(labels), "expected_prior": settings.get("expected_speakers", 4)})
+    progress(1.0, f"Diarization found {len(labels)} voice clusters")
+
+
+# ---------------------------------------------------------------- pure helpers
+
+
+def cosine(a, b) -> float:
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+
+def consolidate_clusters(centroids: dict, durations: dict, expected: int = 4, minor_s: float = 45.0,
+                         merge_sim: float = 0.60) -> dict:
+    """Four speakers is a prior, not a rule.
+
+    Clusters with little speech are merged into their most similar major cluster only if
+    similarity is high. Otherwise they are kept and later flagged, never forced.
+    Returns {cluster: merged_into_cluster}.
+    """
+    majors = [c for c, d in durations.items() if d >= minor_s]
+    if len(majors) < 2:
+        majors = sorted(durations, key=durations.get, reverse=True)[:max(2, min(expected, len(durations)))]
+    mapping = {c: c for c in durations}
+    if len(durations) <= expected:
+        return mapping
+    for c, d in durations.items():
+        if c in majors:
+            continue
+        best, bs = None, 0.0
+        for m in majors:
+            s = cosine(centroids[c], centroids[m])
+            if s > bs:
+                best, bs = m, s
+        if best is not None and bs >= merge_sim:
+            mapping[c] = best
+    return mapping
+
+
+def _overlap(a0, a1, b0, b1) -> float:
+    return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+class TurnIndex:
+    def __init__(self, turns: list[dict], cluster_map: dict | None = None):
+        cm = cluster_map or {}
+        self.turns = sorted(({"start": t["start"], "end": t["end"], "cluster": cm.get(t["cluster"], t["cluster"])}
+                             for t in turns), key=lambda t: t["start"])
+        self.starts = [t["start"] for t in self.turns]
+        self.max_len = max((t["end"] - t["start"] for t in self.turns), default=0)
+
+    def coverage(self, s: float, e: float) -> dict[str, float]:
+        import bisect
+        lo = bisect.bisect_left(self.starts, s - self.max_len - 1)
+        res: dict[str, float] = defaultdict(float)
+        for t in self.turns[lo:]:
+            if t["start"] >= e:
+                break
+            o = _overlap(s, e, t["start"], t["end"])
+            if o > 0:
+                res[t["cluster"]] += o
+        return res
+
+    def nearest(self, s: float, e: float, within: float = 0.6) -> str | None:
+        best, bd = None, within
+        for t in self.turns:
+            d = max(t["start"] - e, s - t["end"], 0.0)
+            if d < bd:
+                best, bd = t["cluster"], d
+            if t["start"] > e + within:
+                break
+        return best
+
+
+def assign_words(segment: dict, idx: TurnIndex) -> list[dict]:
+    """Split one ASR segment into per-speaker utterances using word timings.
+
+    Each utterance has: cluster, overlap flag, other clusters speaking at the same time,
+    and the fraction of its words that diarization actually covered.
+    """
+    words = segment.get("words") or []
+    if not words:
+        cov = idx.coverage(segment["start"], segment["end"])
+        cl = max(cov, key=cov.get) if cov else idx.nearest(segment["start"], segment["end"])
+        others = sorted(c for c in cov if c != cl and cov[c] > 0.3 * (segment["end"] - segment["start"]))
+        return [{"start": segment["start"], "end": segment["end"], "text": segment["text"], "words": [],
+                 "cluster": cl, "overlap": bool(others), "overlaps_with": others, "coverage": 1.0 if cov else 0.0,
+                 "lang": segment.get("lang"), "src": segment}]
+    labelled = []
+    for w in words:
+        s, e = w["s"], max(w["e"], w["s"] + 0.01)
+        cov = idx.coverage(s, e)
+        total = e - s
+        if cov:
+            cl = max(cov, key=cov.get)
+            others = [c for c, v in cov.items() if c != cl and v > 0.4 * total]
+            labelled.append((w, cl, bool(others), others, cov[cl] / total))
+        else:
+            labelled.append((w, idx.nearest(s, e), False, [], 0.0))
+    # runs
+    runs: list[list] = []
+    for item in labelled:
+        if runs and runs[-1][0][1] == item[1]:
+            runs[-1].append(item)
+        else:
+            runs.append([item])
+    # smooth weak sandwiched runs
+    changed = True
+    while changed and len(runs) >= 3:
+        changed = False
+        for i in range(1, len(runs) - 1):
+            r = runs[i]
+            if runs[i - 1][0][1] == runs[i + 1][0][1] != r[0][1]:
+                weak = len(r) <= 1 and (sum(x[4] for x in r) / len(r)) < 0.6
+                if weak:
+                    for x in r:
+                        runs[i - 1].append((x[0], runs[i - 1][0][1], x[2], x[3], x[4]))
+                    runs[i - 1].extend(runs[i + 1])
+                    del runs[i:i + 2]
+                    changed = True
+                    break
+    out = []
+    for r in runs:
+        ws = [x[0] for x in r]
+        text = "".join(w["w"] for w in ws).strip()
+        others = sorted({c for x in r for c in x[3]})
+        out.append({"start": ws[0]["s"], "end": ws[-1]["e"], "text": text, "words": ws, "cluster": r[0][1],
+                    "overlap": any(x[2] for x in r), "overlaps_with": others,
+                    "coverage": sum(1 for x in r if x[4] > 0) / len(r), "lang": segment.get("lang"),
+                    "src": segment})
+    return out
