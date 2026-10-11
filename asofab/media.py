@@ -29,11 +29,20 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
                           creationflags=flags)
 
 
+def _fail(tool: str, exe: str, r: subprocess.CompletedProcess) -> RuntimeError:
+    detail = (r.stderr or "").strip()[:300]
+    if not detail:
+        detail = ("no error output. The program itself may not be runnable "
+                  f"(a missing or damaged {tool} binary); check that the file above is a full-size {tool}.exe")
+    return RuntimeError(f"{tool} failed (exit code {r.returncode}, {exe}): {detail}")
+
+
 def probe(path: Path) -> dict:
-    r = _run([_bin("ffprobe"), "-v", "error", "-print_format", "json", "-show_format",
+    exe = _bin("ffprobe")
+    r = _run([exe, "-v", "error", "-print_format", "json", "-show_format",
               "-show_streams", "-show_chapters", str(path)])
     if r.returncode != 0:
-        raise RuntimeError(f"ffprobe failed: {r.stderr.strip()[:300]}")
+        raise _fail("ffprobe", exe, r)
     return json.loads(r.stdout)
 
 
@@ -89,7 +98,7 @@ def extract_audio(src: Path, dest: Path, stream_index: int | None = None) -> Pat
     cmd += ["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dest)]
     r = _run(cmd)
     if r.returncode != 0 or not dest.exists():
-        raise RuntimeError(f"Audio extraction failed: {r.stderr.strip()[:300]}")
+        raise _fail("ffmpeg", cmd[0], r)
     return dest
 
 

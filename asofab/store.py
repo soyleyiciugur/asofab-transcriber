@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -32,10 +33,25 @@ PEOPLE = {
 UNKNOWN = "Unknown Speaker [to be checked]"
 
 
+# One lock for all job-file access in this process. The UI polls job.json every 2 s while the
+# background job saves progress; on Windows os.replace() fails with "access denied" if another
+# thread (or antivirus/indexer) has the target open at that instant.
+_LOCK = threading.RLock()
+
+
 def atomic_write(path: Path, data: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, path)
+    with _LOCK:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        for attempt in range(80):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                # Windows: a foreign handle (antivirus, search indexer) can block the swap briefly.
+                if attempt == 79:
+                    raise
+                time.sleep(0.05)
 
 
 class Job:
@@ -74,9 +90,10 @@ class Job:
 
     def read(self, name: str, default: Any = None) -> Any:
         p = self._p(name)
-        if not p.exists():
-            return default
-        return json.loads(p.read_text(encoding="utf-8"))
+        with _LOCK:
+            if not p.exists():
+                return default
+            return json.loads(p.read_text(encoding="utf-8"))
 
     def write(self, name: str, data: Any) -> None:
         atomic_write(self._p(name), data)
@@ -89,24 +106,27 @@ class Job:
         self.write("job.json", m)
 
     def set_stage(self, stage: str, status: str, **extra) -> None:
-        m = self.meta()
-        st = m["stages"].setdefault(stage, {})
-        st.update(status=status, **extra)
-        st["updated"] = time.time()
-        self.save_meta(m)
+        with _LOCK:  # read-modify-write must not interleave with other threads
+            m = self.meta()
+            st = m["stages"].setdefault(stage, {})
+            st.update(status=status, **extra)
+            st["updated"] = time.time()
+            self.save_meta(m)
 
     def stage_status(self, stage: str) -> str:
         return self.meta().get("stages", {}).get(stage, {}).get("status", "pending")
 
     def update_meta(self, **kv) -> None:
-        m = self.meta()
-        m.update(kv)
-        self.save_meta(m)
+        with _LOCK:
+            m = self.meta()
+            m.update(kv)
+            self.save_meta(m)
 
     def add_evidence(self, key: str, value: Any) -> None:
-        m = self.meta()
-        m.setdefault("evidence", {})[key] = value
-        self.save_meta(m)
+        with _LOCK:
+            m = self.meta()
+            m.setdefault("evidence", {})[key] = value
+            self.save_meta(m)
 
     # ---- partial progress for long stages (ASR chunks)
     def chunk_path(self, kind: str, idx: int) -> Path:

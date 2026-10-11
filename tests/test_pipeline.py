@@ -313,3 +313,57 @@ def test_missing_oauth_client_is_a_readable_error(client):
     assert r.status_code == 400 and r.json()["code"] == "no_client_secret"
     r = c.post("/api/google/client-secret", json={"text": json.dumps({"web": {}})}, headers={"x-asofab-token": tok})
     assert r.status_code == 400 and r.json()["code"] == "bad_client_secret"
+
+
+# ------------------------------------------- Windows file-replace races
+
+def test_atomic_write_survives_a_briefly_locked_target(monkeypatch):
+    """Windows raises PermissionError from os.replace while another handle is open. It must retry."""
+    import os as _os
+    from asofab import store
+    j = Job.create("x")
+    real = _os.replace
+    calls = {"n": 0}
+
+    def flaky(a, b):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise PermissionError(5, "Access is denied")
+        return real(a, b)
+    monkeypatch.setattr(store.os, "replace", flaky)
+    j.set_stage("resolve", "done")
+    assert calls["n"] == 4 and Job(j.id).stage_status("resolve") == "done"
+
+
+def test_concurrent_polling_and_saving_never_raises():
+    """Mimics the browser polling job.json while the background job saves progress."""
+    import threading
+    j = Job.create("x")
+    errors, stop = [], threading.Event()
+
+    def poller():
+        while not stop.is_set():
+            try:
+                Job(j.id).meta()
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+    def writer(stage):
+        try:
+            for i in range(150):
+                j.set_stage(stage, "running", fraction=i / 150)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    ts = [threading.Thread(target=poller) for _ in range(2)]
+    ws = [threading.Thread(target=writer, args=(s,)) for s in ("asr", "diarize")]
+    for t in ts + ws:
+        t.start()
+    for w in ws:
+        w.join()
+    stop.set()
+    for t in ts:
+        t.join()
+    assert errors == []
+    m = Job(j.id).meta()["stages"]  # no lost update: both writers' stages survived
+    assert m["asr"]["status"] == "running" and m["diarize"]["status"] == "running"

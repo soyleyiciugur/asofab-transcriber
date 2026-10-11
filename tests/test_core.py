@@ -332,3 +332,13 @@ def test_multiple_streams_without_metadata_are_not_separate_tracks():
     info = {"streams": [{"codec_type": "audio", "index": 0, "channels": 1},
                         {"codec_type": "audio", "index": 1, "channels": 1}], "format": {}}
     assert media.summarize_probe(info)["has_separate_audio_tracks"] is False
+
+
+def test_ffprobe_failure_message_is_never_empty(tmp_path):
+    import pytest
+    junk = tmp_path / "notmedia.bin"
+    junk.write_bytes(b"this is not a recording")
+    with pytest.raises(RuntimeError) as e:
+        media.probe(junk)
+    msg = str(e.value)
+    assert msg.startswith("ffprobe failed (exit code") and not msg.rstrip().endswith(":")
