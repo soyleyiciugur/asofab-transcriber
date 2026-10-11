@@ -16,6 +16,8 @@ def free_port() -> int:
 
 def main() -> None:
     import uvicorn
+    from . import hf_compat
+    hf_compat.install()
     from .server import app
     port = int(os.environ.get("ASOFAB_PORT") or 0) or free_port()  # fixed port is for the CI smoke test
     url = f"http://127.0.0.1:{port}/"

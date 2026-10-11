@@ -342,3 +342,28 @@ def test_ffprobe_failure_message_is_never_empty(tmp_path):
         media.probe(junk)
     msg = str(e.value)
     assert msg.startswith("ffprobe failed (exit code") and not msg.rstrip().endswith(":")
+
+
+def test_hf_symlink_failure_falls_back_to_copy(tmp_path, monkeypatch):
+    import sys, types
+    from asofab import hf_compat
+
+    fd = types.ModuleType("huggingface_hub.file_download")
+
+    def boom(src, dst, new_blob=False):
+        raise OSError(1314, "A required privilege is not held by the client")
+    fd._create_symlink = boom
+    fd.are_symlinks_supported = lambda *a, **k: True
+    pkg = types.ModuleType("huggingface_hub")
+    pkg.file_download = fd
+    monkeypatch.setitem(sys.modules, "huggingface_hub", pkg)
+    monkeypatch.setitem(sys.modules, "huggingface_hub.file_download", fd)
+
+    assert hf_compat.install()
+    blob = tmp_path / "blobs" / "abc"
+    blob.parent.mkdir()
+    blob.write_text("data")
+    dst = tmp_path / "snapshots" / "rev" / "config.json"
+    fd._create_symlink(str(blob), str(dst), new_blob=True)
+    assert dst.read_text() == "data"
+    assert fd.are_symlinks_supported() is False
